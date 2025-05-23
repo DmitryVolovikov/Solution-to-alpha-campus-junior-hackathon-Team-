@@ -1,0 +1,213 @@
+# ─────────────────── 0. Imports & paths ───────────────────────
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+ROOT = "/kaggle/input/alfaaaa"
+
+TRAIN_PATH   = f"{ROOT}/train_data.pqt"
+TEST_PATH    = f"{ROOT}/test_data.pqt"
+WEIGHTS_PATH = f"{ROOT}/cluster_weights.xlsx"
+SAMPLE_PATH  = f"{ROOT}/sample_submission.csv"
+
+OUTPUT_PATH  = "answers1.csv"
+GPU_ID       = "0"          # set '' for CPU mode
+
+# ─────────────────── 1. Feature engineering ───────────────────
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Basic row-wise features:
+    * fill start_cluster (object)
+    * map cluster weight
+    * count NaNs
+    * compute numeric ranges / relative ranges
+    """
+    out = df.copy()
+
+    # fill & map weight
+    out["start_cluster"] = out["start_cluster"].fillna("__unknown__")
+    out["cluster_weight_start"] = out["start_cluster"].map(WEIGHT_MAP).fillna(0)
+
+    # NaN counter
+    out["missing_cnt"] = out.isna().sum(axis=1)
+
+    # ranges for *_avg/_max/_min groups
+    num_cols = [c for c in out.select_dtypes(np.number).columns if c != "month"]
+    groups: dict[str, list[str]] = {}
+    for col in num_cols:
+        for suf in ("_avg", "_max", "_min"):
+            if col.endswith(suf):
+                groups.setdefault(col[:-len(suf)], []).append(col)
+
+    for base, cols in groups.items():
+        s = set(cols)
+        if {f"{base}_max", f"{base}_min"} <= s:
+            out[f"{base}_range"] = out[f"{base}_max"] - out[f"{base}_min"]
+        if {f"{base}_max", f"{base}_min", f"{base}_avg"} <= s:
+            denom = out[f"{base}_avg"].abs() + 1e-5
+            out[f"{base}_rel_range"] = (out[f"{base}_max"] - out[f"{base}_min"]) / denom
+    return out
+
+
+def add_trend_features(df: pd.DataFrame,
+                       id_col: str = "id",
+                       month_col: str = "month") -> pd.DataFrame:
+    """
+    Trend block – for every numeric column compute:
+    * delta   = last - first
+    * ratio   = last / first
+    * slope   = linear slope over months
+    """
+    if month_col not in df.columns:
+        return df
+
+    df = df.sort_values([id_col, month_col])
+    nums = df.select_dtypes(np.number).columns.difference([month_col])
+
+    first = df.groupby(id_col)[nums].transform("first")
+    last  = df.groupby(id_col)[nums].transform("last")
+
+    delta = (last - first).add_suffix("_delta")
+    ratio = (last / (first.replace(0, np.nan) + 1e-6)).fillna(0).add_suffix("_ratio")
+
+    m_first = df.groupby(id_col)[month_col].transform("first")
+    m_last  = df.groupby(id_col)[month_col].transform("last")
+    slope = ((last - first) /
+             ((m_last - m_first).replace(0, np.nan) + 1e-5)).fillna(0).add_suffix("_slope")
+
+    return pd.concat([df, delta, ratio, slope], axis=1)
+
+
+# ─────────────────── 2. Metric helper ─────────────────────────
+def weighted_auc(y_int: np.ndarray,
+                 y_pred: np.ndarray,
+                 class_labels: list[str],
+                 weight_map: dict[str, float]) -> float:
+    """Weighted ROC-AUC over classes."""
+    num = den = 0.0
+    for k, lab in enumerate(class_labels):
+        auc = roc_auc_score((y_int == k).astype(int), y_pred[:, k])
+        w   = weight_map.get(lab, 1.0)
+        num += auc * w
+        den += w
+    return num / den
+
+
+# ─────────────────── 3. Main pipeline ─────────────────────────
+def main() -> None:
+    # GPU/CPU selection
+    if GPU_ID:
+        os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
+
+    # ---------- 3.1 load data ----------
+    train = pd.read_parquet(TRAIN_PATH)
+    test  = pd.read_parquet(TEST_PATH)
+
+    target_col = "end_cluster"
+    id_col = "id"
+
+    # ---------- 3.2 weights & numeric imputation ----------
+    global WEIGHT_MAP
+    WEIGHT_MAP = pd.read_excel(WEIGHTS_PATH).set_index("cluster")["unnorm_weight"].to_dict()
+
+    num_cols = train.select_dtypes(np.number).columns
+
+    med_cluster = train.groupby("start_cluster")[num_cols].median()
+    med_global  = train[num_cols].median()
+
+    def impute_numeric(df: pd.DataFrame) -> pd.DataFrame:
+        """fill NaNs in numeric cols with cluster-wise median (fallback global)."""
+        parts = []
+        for sc, grp in df.groupby("start_cluster"):
+            med = med_cluster.loc[sc] if sc in med_cluster.index else med_global
+            parts.append(grp[num_cols].fillna(med))
+        df[num_cols] = pd.concat(parts).sort_index()
+        return df
+
+    train = impute_numeric(train)
+    test  = impute_numeric(test)
+
+    # ---------- 3.3 build all features ----------
+    train = add_trend_features(build_features(train), id_col=id_col)
+    test  = add_trend_features(build_features(test),  id_col=id_col)
+
+    feature_cols = [c for c in train.columns if c not in (target_col, id_col)]
+    cat_cols     = [c for c in feature_cols if train[c].dtype == "object"]
+
+    # fill missing categoricals
+    for col in cat_cols:
+        train[col] = train[col].astype(str).fillna("__miss__")
+        test[col]  = test[col].astype(str).fillna("__miss__")
+
+    cat_idx = [feature_cols.index(c) for c in cat_cols]
+
+    # ---------- 3.4 target encoding ----------
+    le = LabelEncoder().fit(train[target_col])
+    y = le.transform(train[target_col])
+    classes = le.classes_.tolist()
+    n_cls = len(classes)
+
+    # ---------- 3.5 CatBoost params ----------
+    cb_params = dict(
+        iterations           = 2000,
+        depth                = 9,
+        learning_rate        = 0.0530938876545087,
+        l2_leaf_reg          = 6,
+        bagging_temperature  = 1.0,
+        random_strength      = 1.5,
+        loss_function        = "MultiClass",
+        eval_metric          = "MultiClass",
+        task_type            = "GPU" if GPU_ID else "CPU",
+        early_stopping_rounds= 200,
+        verbose              = 200,
+    )
+
+    # ---------- 3.6 3-fold OOF training ----------
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    oof   = np.zeros((len(train), n_cls))
+    preds = np.zeros((len(test),  n_cls))
+
+    for fold, (tr_idx, vl_idx) in enumerate(skf.split(train, y), 1):
+        print(f"\n┌── Fold {fold} ────────────────────────────────────")
+        model = CatBoostClassifier(**cb_params)
+        model.fit(train.iloc[tr_idx][feature_cols], y[tr_idx],
+                  eval_set=(train.iloc[vl_idx][feature_cols], y[vl_idx]),
+                  cat_features=cat_idx,
+                  use_best_model=True)
+
+        oof[vl_idx] = model.predict_proba(train.iloc[vl_idx][feature_cols])
+        preds      += model.predict_proba(test[feature_cols]) / skf.n_splits
+
+    score = weighted_auc(y, oof, classes, WEIGHT_MAP)
+    print(f"\nOOF weighted ROC-AUC = {score:.6f}")
+
+    # ---------- 3.7 build submission ----------
+    sample = pd.read_csv(SAMPLE_PATH)
+    cluster_cols = [c for c in sample.columns if c != "id"]
+
+    pred_df = pd.DataFrame(preds, columns=classes)
+    pred_df[id_col] = test[id_col].values
+    pred_df = (pred_df.drop_duplicates(id_col, keep="last")
+                       .set_index(id_col)
+                       .reindex(sample["id"]))
+
+    # ensure all cluster columns present
+    for col in cluster_cols:
+        if col not in pred_df.columns:
+            pred_df[col] = 0.0
+
+    sample[cluster_cols] = pred_df[cluster_cols].values
+    sample.to_csv(OUTPUT_PATH, index=False, float_format="%.6f")
+    print(f"\n✔ Saved {OUTPUT_PATH}  ({len(sample)} rows)")
+
+
+# ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()
